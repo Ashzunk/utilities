@@ -1,0 +1,3 @@
+keep pressing scroll lock - re typing code I wrote in c in 1990s
+(thanks int 21/4C)
+This time in C# and using windows
