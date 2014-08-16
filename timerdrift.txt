@@ -1,0 +1,314 @@
+dmimac24:DotNetTimerDrift vickram$ cat Program.cs
+/*
+ * DotNet Timer Drift Analyzer by Vickram B
+ * This is finally stable enough and can handle different values for arguments smoonthly
+ * Args are
+ * 1 - the multiplier for Drift adjustment - default 1. Can be made 0 to disable drift
+ *     adjustment
+ * 2 - the interval in milliseconds for the timer
+ * 3 - the run time length in seconds for the program to run
+ *
+ * 4/3/2008 - New - introducting dynamic factor
+ *     prefix any factor (arg 1) with '/' to get the following effect
+ *     - positive drift (event firing later) is adjusted with drift MULTIPLIED by factor
+ *     - negative drift (event firing earlier) is adjusted with drift divided by factor
+ */
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Timers;
+
+public enum DriftAdjType
+{
+    None,             // No adjustment
+    Multiplier,       // Multiply both positive and negative drift by a factor
+    Divider,          // Multiply positive drift by factor and divide negative by the same
+    RunningAverage,   // Uses factor of 1. Take a running average of positive and negative
+                      // drifts separately and use them respectively
+    BehaviorCheck     // Starts with Multiplier of 1, then intelligently switchs between all above
+                      // also checks if timer has stabilized - if so, switches to none until it drifts
+                      // again. Will be a little difficult to implements
+}
+
+namespace DotNetTimerDrift
+{
+    static class Global
+    {
+        public static string Copyright = "Copyright (c) 2008, Vickram B";
+        public static string Helptext = "DotNet Timer Drift - Analyze the drift value of DOTNet Timer";
+        public const int msPerSec = 1000;
+        public const int maxTime = 3600000;
+
+        public static class Args
+        {
+            public static int runTime = 15000;
+            public static bool dynamicDrift = false;
+            public static DriftAdjType dynamicDriftType = DriftAdjType.None;
+            public static int driftFactor = 1;
+            public static int driftInterval = 1000;
+        }
+    }
+
+    class Program
+    {
+        public static Drifter drifter = new Drifter();
+        static void Main(string[] args)
+        {
+            Console.WriteLine(Global.Copyright);
+            Console.WriteLine(Global.Helptext);
+            Console.CancelKeyPress += new ConsoleCancelEventHandler(Console_CancelKeyPress);
+
+            if (args.Length > 0)
+            {
+                int outint;
+                if (args.Length > 0)
+                {
+                    if (Int32.TryParse(args[0], out outint))
+                    {
+                        if (outint >= 0 && outint <= 2) // force it to be between 0 and 2 (only 0,1,2 allowed)
+                        {
+                            Global.Args.driftFactor = outint;
+                        }
+                        else // any other values needs to be prefixed with * for normal / for dynamic
+                        {
+                            Global.Args.driftFactor = 0;
+                        }
+                    }
+                    else
+                    {
+                        if (args[0].Substring(0, 1) == "*")
+                        {
+                            if (Int32.TryParse(args[0].Substring(1), out outint))
+                            {
+                                Global.Args.driftFactor = outint;
+                            } // no need to 0 on else - it is the default
+                            Global.Args.dynamicDriftType = DriftAdjType.None;
+                        }
+                        if (args[0].Substring(0, 1) == "/")
+                        {
+                            Global.Args.dynamicDrift = true;
+                            if (Int32.TryParse(args[0].Substring(1), out outint))
+                            {
+                                Global.Args.driftFactor = outint;
+
+                            } // no need to 0 on else - it is the default
+                            Global.Args.dynamicDriftType = DriftAdjType.Divider;
+                        }
+                        if (args[0].Substring(0, 1) == "%")
+                        {
+                            Global.Args.dynamicDrift = true;
+                            if (Int32.TryParse(args[0].Substring(1), out outint))
+                            {
+                                Global.Args.driftFactor = outint;
+
+                            } // no need to 0 on else - it is the default
+                            Global.Args.dynamicDriftType = DriftAdjType.RunningAverage ;
+                        }
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("Invalid drift factor {0} - set to default {1}", args[0], Global.Args.driftFactor);
+                }
+
+                if (args.Length > 1 && Int32.TryParse(args[1], out outint))
+                {
+                    Global.Args.driftInterval = outint;
+                }
+
+                if (args.Length > 2 && Int32.TryParse(args[2], out outint))
+                {
+                    Global.Args.runTime = outint * Global.msPerSec;
+                    if (Global.Args.runTime > Global.maxTime) Global.Args.runTime = Global.maxTime;
+                }
+            }
+            Console.WriteLine("Test will run for {0} seconds", Global.Args.runTime / Global.msPerSec);
+            Console.WriteLine("Timer interval {0} - Adjustment Multiplier {1}", Global.Args.driftInterval, Global.Args.driftFactor);
+            if (Global.Args.dynamicDrift) Console.WriteLine("Drift dynamically adjusted - Positives multiplied/negatives divided");
+            System.Threading.Thread.Sleep(Global.Args.runTime);
+            drifter.Deinit();
+        }
+
+        static void Console_CancelKeyPress(object sender, ConsoleCancelEventArgs e)
+        {
+            drifter.Deinit();
+        }
+
+    }
+
+    class Drifter
+    {
+        public static bool IsTimerRunning = false;
+        public static DateTime dtTimeStart;
+        public static DateTime dtTimeEnd;
+        public static DateTime dtTimeLast;
+        public static DateTime dtTimeNow;
+        public static string sTimeStart = "";
+        public static string sTimeEnd = "";
+        public static string sTimeNow = "";
+        public static Timer timer1 = new Timer();
+
+        public static double avgDrift = 0.0;
+        public static double totDrift = 0.0;
+        public static double curDrift = 0.0;
+        public static long numDrifts = 0;
+        public static long ticksPersec = 0;
+
+
+        public static string timefmt = "HH:mm:ss.ffffff";
+        public static string timefmt2 = "HH:mm:ss.fff", sTimeExp; //will add -fff later
+        public static string timefmt3 = "ss.ffffff";// for last three fff
+        public static string header = " Expected          Time now           Drift       Adj";
+        public static string header2 = " --------          --------           -----       ---";
+        public static string trailer2 = " --------------------------------";
+        public static string dispfmt = " {0}  {1}  {2:+0.000-000;-0.000-000}  {3,1:+0.000;-0.000}  {4,8:+0.000;-0.000}  {5,4:+0.000;-0.000}";
+        public static string dropfmt = " {0}  {1}  {2} {3:0.00} {4}";
+        public static int consoleLines = 10;
+
+        //Data analysis variables
+        public static double maxPositiveDrift = 0.0;
+        public static double sumPositiveDrift = 0.0;
+        public static double maxNegativeDrift = 0.0;
+        public static double sumNegativeDrift = 0.0;
+
+        public static double maxPositiveAdj = 0.0;
+        public static double sumPositiveAdj = 0.0;
+        public static double maxNegativeAdj = 0.0;
+        public static double sumNegativeAdj = 0.0;
+
+
+        public Drifter()
+        {
+            timer1.Elapsed += new ElapsedEventHandler(timer1_Elapsed);
+            Init();
+        }
+
+        void Init()
+        {
+            timer1.Interval = Global.Args.driftInterval;
+            timer1.AutoReset = true;
+            timer1.Start();
+        }
+
+
+        static void timer1_Elapsed(object sender, ElapsedEventArgs e)
+        {
+            DateTime enterTime = DateTime.Now,dtTimeExp;
+            int driftAdjustment = 0;
+            timer1.Stop();
+
+            double oldInterval = timer1.Interval;
+
+            dtTimeNow = enterTime;
+            sTimeNow = dtTimeNow.ToString(timefmt2) + "-" + dtTimeNow.ToString(timefmt3).Substring(6);
+            dtTimeExp = dtTimeStart.AddMilliseconds(numDrifts * Global.Args.driftInterval);
+            sTimeExp = dtTimeExp.ToString(timefmt2) + "-" + dtTimeExp.ToString(timefmt3).Substring(6);
+            numDrifts++;
+
+            if (!IsTimerRunning)
+            {
+                IsTimerRunning = true;
+                dtTimeStart = enterTime;
+                dtTimeLast = enterTime;
+                sTimeStart = dtTimeStart.ToString(timefmt2);
+                ticksPersec = dtTimeStart.AddSeconds(1.0).Ticks - dtTimeStart.Ticks;
+                driftAdjustment = 0;
+                Console.WriteLine("Timer ticks at {0} ticks per second", ticksPersec);
+                Console.WriteLine(trailer2);
+                Console.WriteLine(" Timer Started at {0}", sTimeStart);
+                Console.WriteLine(trailer2);
+                Console.WriteLine(header2);
+                Console.WriteLine(header);
+                Console.WriteLine(header2);
+
+            }
+            else
+            {
+                // another diff logic for curdrift - the best IMO
+                curDrift = (dtTimeNow.Ticks - dtTimeExp.Ticks) / (double)ticksPersec;
+                totDrift += curDrift;
+
+                avgDrift = totDrift / (double)numDrifts;
+
+                // Find how much to adjust
+                if (Global.Args.dynamicDrift)
+                {
+                    if (curDrift == 0.0)
+                    {
+                        //driftAdjustment = (-1) * (int)Math.Round((curDrift * Global.msPerSec) * Global.Args.driftFactor);
+                    }
+                    else
+                    {
+                        if (curDrift > 0.0)
+                        {
+                            driftAdjustment = (-1) * (int)Math.Round((curDrift * Global.msPerSec) * Global.Args.driftFactor);
+                        }
+                        else
+                        {
+                            driftAdjustment = (-1) * (int)Math.Round((curDrift * Global.msPerSec) / Global.Args.driftFactor);
+                        }
+                    }
+                }
+                else
+                {
+                    driftAdjustment = (-1) * (int)Math.Round((curDrift * Global.msPerSec) * Global.Args.driftFactor);
+                }
+
+                if ((numDrifts % consoleLines) == 0)
+                {
+                    Console.WriteLine(header2);
+                    Console.WriteLine(header);
+                    Console.WriteLine(header2);
+                }
+                Console.WriteLine(dispfmt, sTimeExp, sTimeNow, curDrift, driftAdjustment / (double)Global.msPerSec, totDrift, avgDrift);
+                dtTimeLast = enterTime;
+
+            }
+
+            // Check if we need to skip a frame/event or two
+            int newInterval = Global.Args.driftInterval + driftAdjustment;
+            int droppedFrames = 0;
+            while (newInterval<=0) {
+                newInterval = newInterval + Global.Args.driftInterval;
+                droppedFrames++;
+            }
+            DateTime dtTimeSkip = DateTime.Now;
+            string sTimeSkip = dtTimeSkip.ToString(timefmt2) + "-" + dtTimeSkip.ToString(timefmt3).Substring(6);
+            if (droppedFrames > 0) Console.WriteLine(dropfmt, sTimeExp, sTimeSkip, "*** Skipped ***", droppedFrames / (float)Global.Args.driftFactor, "frame(s) dropped");
+
+            // Gather stats
+            // Max drift so far
+            if (curDrift > maxPositiveDrift) maxPositiveDrift = curDrift;
+            if (curDrift < maxNegativeDrift) maxNegativeDrift = curDrift;
+
+            // Max adj so far
+            double curAdj = driftAdjustment / 1000.0;
+            if (curAdj > maxPositiveAdj) maxPositiveAdj = curAdj;
+            if (curAdj < maxNegativeAdj) maxNegativeAdj = curAdj;
+
+            // Restart Timer
+            timer1.Interval = newInterval;
+            timer1.Start();
+        }
+
+        public void Deinit()
+        {
+            DateTime enterTime = DateTime.Now;
+            timer1.Stop();
+
+            dtTimeEnd = enterTime;
+            Console.WriteLine(trailer2);
+            Console.WriteLine(" Timer Ended   at {0}     ", sTimeNow);
+            Console.WriteLine(trailer2);
+            Console.WriteLine("Timer Settings:");
+            Console.WriteLine(" Timer interval {0}.  Adjustment Multiplier {1}. Test run for {2} seconds", Global.Args.driftInterval, Global.Args.driftFactor,Global.Args.runTime/1000 );
+            if (Global.Args.dynamicDrift) Console.WriteLine(" Dynamic Setting: Positive drift multiplied, negatives divided by {0}.", Global.Args.driftFactor);
+            Console.WriteLine("");
+            Console.WriteLine("Stats for this run: Started at {0}, Ended at {1}", sTimeStart, sTimeNow);
+            Console.WriteLine(" Drift:      Highest was {0:0.000-000} seconds. Lowest was {1:0.000-000} seconds.", maxPositiveDrift, maxNegativeDrift);
+            Console.WriteLine(" Adjustment: Highest was {0:0.000-000} seconds. Lowest was {1:0.000-000} seconds.", maxPositiveAdj, maxNegativeAdj);
+            Console.WriteLine("End of Stats");
+        }
+    }
+}
